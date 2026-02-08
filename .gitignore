@@ -1,0 +1,17 @@
+# Keil
+*.uvguix.*
+Objects/
+Listings/
+DebugConfig/
+*.bak
+.eide/
+.vscode/
+build/
+
+# 编译产物
+*.o
+*.d
+*.hex
+*.bin
+*.elf
+*.map
