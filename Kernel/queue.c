@@ -60,18 +60,23 @@ QueueHandle_t xQueueCreate(uint32_t uxQueueLength, uint32_t uxItemSize)
  *---------------------------------------------------------------------------*/
 static void prvCopyDataToQueue(Queue_t *pxQueue, const void *pvItemToQueue)
 {
-    /* 拷贝数据到写入位置 */
-    memcpy((void *)pxQueue->pcWriteTo, pvItemToQueue, pxQueue->uxItemSize);
-
-    /* 写指针往后移 */
-    pxQueue->pcWriteTo += pxQueue->uxItemSize;
-
-    /* 到末尾就绕回开头 */
-    if (pxQueue->pcWriteTo >= pxQueue->pcTail)
+    /*针对于有数据的情况才进行拷贝，比如消息队列，排除二值信号量和计数信号量*/
+    if (pxQueue->uxItemSize > 0)
     {
-        pxQueue->pcWriteTo = pxQueue->pcHead;
+        /* 拷贝数据到写入位置 */
+        memcpy((void *)pxQueue->pcWriteTo, pvItemToQueue, pxQueue->uxItemSize);
+
+        /* 写指针往后移 */
+        pxQueue->pcWriteTo += pxQueue->uxItemSize;
+
+        /* 到末尾就绕回开头 */
+        if (pxQueue->pcWriteTo >= pxQueue->pcTail)
+        {
+            pxQueue->pcWriteTo = pxQueue->pcHead;
+        }
     }
 
+    /*二值信号量和计数信号量只管将队列元素加加就可以了*/
     pxQueue->uxMessagesWaiting++;
 }
 
@@ -80,18 +85,23 @@ static void prvCopyDataToQueue(Queue_t *pxQueue, const void *pvItemToQueue)
  *---------------------------------------------------------------------------*/
 static void prvCopyDataFromQueue(Queue_t *pxQueue, void *pvBuffer)
 {
-    /* 读指针先往后移 */
-    pxQueue->pcReadFrom += pxQueue->uxItemSize;
-
-    /* 到末尾就绕回开头 */
-    if (pxQueue->pcReadFrom >= pxQueue->pcTail)
+    if (pxQueue->uxItemSize > 0)
     {
-        pxQueue->pcReadFrom = pxQueue->pcHead;
+
+        /* 读指针先往后移 */
+        pxQueue->pcReadFrom += pxQueue->uxItemSize;
+
+        /* 到末尾就绕回开头 */
+        if (pxQueue->pcReadFrom >= pxQueue->pcTail)
+        {
+            pxQueue->pcReadFrom = pxQueue->pcHead;
+        }
+
+        /* 从读取位置拷贝数据 */
+        memcpy(pvBuffer, (void *)pxQueue->pcReadFrom, pxQueue->uxItemSize);
     }
 
-    /* 从读取位置拷贝数据 */
-    memcpy(pvBuffer, (void *)pxQueue->pcReadFrom, pxQueue->uxItemSize);
-
+    /*和上一个函数一样，只管元素数量，不考虑数据拷贝*/
     pxQueue->uxMessagesWaiting--;
 }
 

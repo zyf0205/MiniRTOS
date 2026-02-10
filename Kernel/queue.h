@@ -12,6 +12,8 @@ void prvRemoveTaskFromReadyList(TCB_t *pxTCB);
 void prvAddCurrentTaskToDelayedList(uint32_t xTicksToDelay);
 extern volatile uint32_t xTickCount;
 
+#define portMAX_DELAY 0xFFFFFFFF /*死等阻塞，当阻塞时间为0xFFFFFFFF 时不会加入阻塞队列，只会在队列等待队列里面等待唤醒*/
+
 /*---------------------------------------------------------------------------
  *  队列结构
  *---------------------------------------------------------------------------*/
