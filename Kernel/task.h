@@ -84,4 +84,15 @@ uint32_t xTaskGetTickCount(void);
 /* ---- 临界区 ---- */
 void vPortEnterCritical(void);
 void vPortExitCritical(void);
+
+/*空闲任务钩子函数*/
+void vApplicationIdleHook(void);
+
+/* 挂起/恢复/删除 */
+void vTaskSuspend(TaskHandle_t xTaskToSuspend);
+void vTaskResume(TaskHandle_t xTaskToResume);
+void vTaskDelete(TaskHandle_t xTaskToDelete);
+
+/*安全打印*/
+void vSafePrintf(const char *fmt, ...);
 #endif

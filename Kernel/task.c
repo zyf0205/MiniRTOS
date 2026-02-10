@@ -1,5 +1,7 @@
 #include "task.h"
 #include <string.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stm32f4xx.h>
 
 /*---------------------------------------------------------------------------
@@ -14,6 +16,17 @@ List_t pxReadyTasksLists[MAX_PRIORITIES];
 
 /* 优先级位图：bit N = 1 表示优先级 N 有任务就绪 */
 static uint32_t uxTopReadyPriority = 0;
+
+/* 挂起链表 */
+static List_t xSuspendedTaskList;
+
+/* 删除等待链表（等空闲任务来回收） */
+static List_t xTasksWaitingTermination;
+static volatile uint32_t uxDeletedTasksWaitingCleanUp = 0;
+
+/* 空闲任务的栈和 TCB */
+static uint32_t xIdleTaskStack[128];
+static TCB_t xIdleTaskTCB;
 
 /* 系统节拍计数 */
 static volatile uint32_t xTickCount = 0;
@@ -333,29 +346,211 @@ void vPortExitCritical(void)
     }
 }
 
+/*空闲任务函数*/
+static void prvIdleTask(void *param)
+{
+    (void)param;
+
+    while (1)
+    {
+        /* 可以在这里调用用户的钩子函数 */
+        /* vApplicationIdleHook(); */
+    }
+}
+
+/*创建空闲任务，调度器启动时调用*/
+static void prvCreateIdleTask(void)
+{
+    xIdleTaskTCB.pxStack = xIdleTaskStack;
+    xIdleTaskTCB.ulStackSize = 128;
+    xIdleTaskTCB.pxTopOfStack = prvInitialiseStack(
+        xIdleTaskStack + 128,
+        prvIdleTask,
+        NULL);
+    xIdleTaskTCB.uxPriority = 0; /* 最低优先级 */
+
+    strncpy(xIdleTaskTCB.pcTaskName, "IDLE", TASK_NAME_LEN - 1);
+    xIdleTaskTCB.pcTaskName[TASK_NAME_LEN - 1] = '\0';
+
+    vListInitItem(&(xIdleTaskTCB.xStateListItem));
+    xIdleTaskTCB.xStateListItem.pvOwner = &xIdleTaskTCB;
+
+    prvAddTaskToReadyList(&xIdleTaskTCB);
+}
+
+/*---------------------------------------------------------------------------
+ *  从就绪链表中移除任务
+ *  同时更新优先级位图
+ *---------------------------------------------------------------------------*/
+static void prvRemoveTaskFromReadyList(TCB_t *pxTCB)
+{
+    /* 从链表中移除，返回剩余节点数 */
+    if (uxListRemove(&(pxTCB->xStateListItem)) == 0)
+    {
+        /* 这个优先级没有任务了，清除位图中对应的位 */
+        uxTopReadyPriority &= ~(1UL << pxTCB->uxPriority);
+    }
+}
+
+/*---------------------------------------------------------------------------
+ *  挂起任务
+ *
+ *  把任务从就绪链表移到挂起链表
+ *  如果挂起的是当前任务，立刻切换
+ *---------------------------------------------------------------------------*/
+void vTaskSuspend(TaskHandle_t xTaskToSuspend)
+{
+    TCB_t *pxTCB;
+
+    taskENTER_CRITICAL();
+
+    /* NULL 表示挂起自己 */
+    if (xTaskToSuspend == NULL)
+    {
+        pxTCB = pxCurrentTCB;
+    }
+    else
+    {
+        pxTCB = xTaskToSuspend;
+    }
+
+    /* 从就绪链表移除 */
+    prvRemoveTaskFromReadyList(pxTCB);
+
+    /* 加入挂起链表 */
+    vListInsertEnd(&xSuspendedTaskList, &(pxTCB->xStateListItem));
+
+    taskEXIT_CRITICAL();
+
+    /* 如果挂起的是自己，立刻触发切换 */
+    if (pxTCB == pxCurrentTCB)
+    {
+        portNVIC_INT_CTRL_REG = portNVIC_PENDSVSET_BIT;
+    }
+}
+
+/*---------------------------------------------------------------------------
+ *  恢复任务
+ *
+ *  把任务从挂起链表移回就绪链表
+ *  如果恢复的任务优先级比当前任务高，触发切换
+ *---------------------------------------------------------------------------*/
+void vTaskResume(TaskHandle_t xTaskToResume)
+{
+    TCB_t *pxTCB = xTaskToResume;
+
+    /* 不能恢复 NULL，不能恢复自己（自己在运行，没被挂起） */
+    if (pxTCB == NULL || pxTCB == pxCurrentTCB)
+    {
+        return;
+    }
+
+    taskENTER_CRITICAL();
+
+    /* 确认任务确实在挂起链表中 */
+    if (pxTCB->xStateListItem.pvContainer == &xSuspendedTaskList)
+    {
+        /* 从挂起链表移除 */
+        uxListRemove(&(pxTCB->xStateListItem));
+
+        /* 加回就绪链表 */
+        prvAddTaskToReadyList(pxTCB);
+
+        /* 如果恢复的任务优先级更高，触发切换 */
+        if (pxTCB->uxPriority > pxCurrentTCB->uxPriority)
+        {
+            portNVIC_INT_CTRL_REG = portNVIC_PENDSVSET_BIT;
+        }
+    }
+
+    taskEXIT_CRITICAL();
+}
+
+/*---------------------------------------------------------------------------
+ *  删除任务
+ *
+ *  从就绪/挂起链表移除
+ *  如果删除的是自己，切换到其他任务
+ *
+ *  注意：Phase 1 用的是静态分配，所以这里只是从链表移除
+ *  不需要释放内存。后续改成动态分配时再加内存释放。
+ *---------------------------------------------------------------------------*/
+void vTaskDelete(TaskHandle_t xTaskToDelete)
+{
+    TCB_t *pxTCB;
+
+    taskENTER_CRITICAL();
+
+    /* NULL 表示删除自己 */
+    if (xTaskToDelete == NULL)
+    {
+        pxTCB = pxCurrentTCB;
+    }
+    else
+    {
+        pxTCB = xTaskToDelete;
+    }
+
+    /* 从当前所在链表移除（可能在就绪或挂起链表） */
+    if (pxTCB->xStateListItem.pvContainer != NULL)
+    {
+        uxListRemove(&(pxTCB->xStateListItem));
+
+        /* 如果是从就绪链表移除的，更新位图 */
+        if (pxReadyTasksLists[pxTCB->uxPriority].uxNumberOfItems == 0)
+        {
+            uxTopReadyPriority &= ~(1UL << pxTCB->uxPriority);
+        }
+    }
+
+    taskEXIT_CRITICAL();
+
+    /* 如果删除的是自己，切换到其他任务 */
+    if (pxTCB == pxCurrentTCB)
+    {
+        portNVIC_INT_CTRL_REG = portNVIC_PENDSVSET_BIT;
+    }
+}
+
+/*线程安全打印*/
+void vSafePrintf(const char *fmt, ...)
+{
+    va_list args;
+
+    taskENTER_CRITICAL();
+
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+
+    taskEXIT_CRITICAL();
+}
+
 /*---------------------------------------------------------------------------
  *  启动调度器
  *---------------------------------------------------------------------------*/
 void vTaskStartScheduler(void)
 {
+    /* 初始化挂起链表和删除等待链表 */
+    vListInit(&xSuspendedTaskList);
+    vListInit(&xTasksWaitingTermination);
 
-    /* --- 注意：此时任务应该已经创建好了 --- */
+    /* 创建空闲任务 */
+    prvCreateIdleTask();
 
-    /* 2. 选出最高优先级任务 */
+    /* 选出最高优先级任务 */
     prvSelectHighestPriorityTask();
 
-    /* 3. 配置 PendSV 和 SysTick 为最低优先级 */
-    /*    SHPR3 寄存器: PendSV = [23:16], SysTick = [31:24] */
-    (*((volatile uint32_t *)0xE000ED20)) |= (0xFFUL << 16); /* PendSV */
-    (*((volatile uint32_t *)0xE000ED20)) |= (0xFFUL << 24); /* SysTick */
+    /* PendSV 和 SysTick 设为最低优先级 */
+    (*((volatile uint32_t *)0xE000ED20)) |= (0xFFUL << 16);
+    (*((volatile uint32_t *)0xE000ED20)) |= (0xFFUL << 24);
 
     /* 启动 SysTick */
     prvStartSysTick();
 
-    /* 4. 启动第一个任务（触发 SVC） */
+    /* 启动第一个任务 */
     vPortStartFirstTask();
 
-    /* 不应该到这里 */
     while (1)
         ;
 }
