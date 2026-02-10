@@ -4,11 +4,13 @@
 #include "usart.h"
 #include "task.h"
 
-/* 保存任务句柄，用于挂起/恢复/删除 */
 TaskHandle_t hTask1 = NULL;
 TaskHandle_t hTask2 = NULL;
 TaskHandle_t hTask3 = NULL;
 
+/*===========================================================
+ *  Task1：每 500ms 打印一次（优先级 1）
+ *===========================================================*/
 void Task1_Red(void *param)
 {
     (void)param;
@@ -16,27 +18,15 @@ void Task1_Red(void *param)
 
     while (1) {
         vSafePrintf("[R] count=%d tick=%d\r\n",
-                    (int)count, (int)xTaskGetTickCount());
-        for (volatile uint32_t i = 0; i < 500000; i++);
+                    (int)count++, (int)xTaskGetTickCount());
 
-        count++;
-
-        if (count == 3) {
-            vSafePrintf(">>> Suspend Task2\r\n");
-            vTaskSuspend(hTask2);
-        }
-        if (count == 6) {
-            vSafePrintf(">>> Resume Task2\r\n");
-            vTaskResume(hTask2);
-        }
-        if (count == 8) {
-            vSafePrintf(">>> Suspend myself\r\n");
-            vTaskSuspend(NULL);
-            vSafePrintf(">>> I'm back!\r\n");
-        }
+        vTaskDelay(500); /* 阻塞 500ms，让出 CPU */
     }
 }
 
+/*===========================================================
+ *  Task2：每 1000ms 打印一次（优先级 1）
+ *===========================================================*/
 void Task2_Blue(void *param)
 {
     (void)param;
@@ -45,10 +35,14 @@ void Task2_Blue(void *param)
     while (1) {
         vSafePrintf("[B] count=%d tick=%d\r\n",
                     (int)count++, (int)xTaskGetTickCount());
-        for (volatile uint32_t i = 0; i < 500000; i++);
+
+        vTaskDelay(1000); /* 阻塞 1000ms */
     }
 }
 
+/*===========================================================
+ *  Task3：每 2000ms 打印一次（优先级 2，更高）
+ *===========================================================*/
 void Task3_Green(void *param)
 {
     (void)param;
@@ -56,19 +50,9 @@ void Task3_Green(void *param)
 
     while (1) {
         vSafePrintf("[G] count=%d tick=%d\r\n",
-                    (int)count, (int)xTaskGetTickCount());
-        for (volatile uint32_t i = 0; i < 500000; i++);
+                    (int)count++, (int)xTaskGetTickCount());
 
-        count++;
-
-        if (count == 12) {
-            vSafePrintf(">>> Resume Task1\r\n");
-            vTaskResume(hTask1);
-        }
-        if (count == 14) {
-            vSafePrintf(">>> delete Task1\r\n");
-            vTaskDelete(hTask1);
-        }
+        vTaskDelay(2000); /* 阻塞 2000ms */
     }
 }
 
@@ -82,13 +66,12 @@ int main(void)
 
     printf("\r\n\r\n");
     printf("===========================\r\n");
-    printf("  MiniRTOS Phase 3 Test\r\n");
+    printf("  MiniRTOS Phase 4 Test\r\n");
     printf("===========================\r\n\r\n");
 
-    /* 三个任务同优先级 */
     xTaskCreate(Task1_Red, "Task1", 128, NULL, 1, &hTask1);
     xTaskCreate(Task2_Blue, "Task2", 128, NULL, 1, &hTask2);
-    xTaskCreate(Task3_Green, "Task3", 128, NULL, 1, &hTask3);
+    xTaskCreate(Task3_Green, "Task3", 128, NULL, 2, &hTask3);
 
     printf("Starting scheduler...\r\n\r\n");
     vTaskStartScheduler();

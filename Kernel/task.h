@@ -93,6 +93,9 @@ void vTaskSuspend(TaskHandle_t xTaskToSuspend);
 void vTaskResume(TaskHandle_t xTaskToResume);
 void vTaskDelete(TaskHandle_t xTaskToDelete);
 
+/* 任务延时 */
+void vTaskDelay(uint32_t xTicksToDelay);
+
 /*安全打印*/
 void vSafePrintf(const char *fmt, ...);
 #endif
