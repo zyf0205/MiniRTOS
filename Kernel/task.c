@@ -1,3 +1,10 @@
+/*****************************************************************************
+ * @file        task.c
+ * @brief       任务管理
+ * @author      zyf
+ * @version     1.0
+ *****************************************************************************/
+
 #include "task.h"
 #include <string.h>
 #include <stdarg.h>
@@ -7,22 +14,8 @@
 /*---------------------------------------------------------------------------
  *  全局变量
  *---------------------------------------------------------------------------*/
-
-/* 当前正在运行的任务 TCB 的指针(句柄)*/
+/*当前正在运行任务的句柄*/
 TCB_t *volatile pxCurrentTCB = NULL;
-
-/* 就绪链表数组：每个优先级一条链表 */
-List_t pxReadyTasksLists[MAX_PRIORITIES];
-
-/* 优先级位图：bit N = 1 表示优先级 N 有任务就绪 */
-static uint32_t uxTopReadyPriority = 0;
-
-/* 挂起链表 */
-static List_t xSuspendedTaskList;
-
-/* 删除等待链表（等空闲任务来回收） */
-static List_t xTasksWaitingTermination;
-static volatile uint32_t uxDeletedTasksWaitingCleanUp = 0;
 
 /* 空闲任务的栈和 TCB */
 static uint32_t xIdleTaskStack[128];
@@ -34,7 +27,17 @@ static volatile uint32_t xTickCount = 0;
 /* 临界区嵌套计数 */
 static volatile uint32_t uxCriticalNesting = 0;
 
-/*延时链表*/
+/*就绪链表数组和优先级位图*/
+List_t pxReadyTasksLists[MAX_PRIORITIES]; /* 就绪链表数组：每个优先级一条链表 */
+static uint32_t uxTopReadyPriority = 0;   /* 优先级位图：bit N = 1 表示优先级 N 有任务就绪 */
+
+/* 挂起链表 */
+static List_t xSuspendedTaskList;
+
+/* 删除等待链表（等空闲任务来回收） */
+static List_t xTasksWaitingTermination;
+
+/*延时链表，使用两个链表，应对xNextTaskUnblockTime溢出情况*/
 static List_t xDelayedTaskList1;
 static List_t xDelayedTaskList2;
 static List_t *pxDelayedTaskList;                             /* 当前延时链表 */
@@ -48,28 +51,27 @@ static void prvTaskExitError(void);
 static uint32_t *prvInitialiseStack(uint32_t *pxTopOfStack,
                                     TaskFunction_t pxCode,
                                     void *pvParam);
+static void prvAddTaskToReadyList(TCB_t *pxTCB);
+static void prvSelectHighestPriorityTask(void);
+static void prvSwitchDelayedLists(void);
+static void prvIdleTask(void *param);
+static void prvCreateIdleTask(void);
 
-/* 汇编函数，Step 3 再写 */
+/*---------------------------------------------------------------------------
+ *  三个汇编函数，在portasm.s中编写
+ *---------------------------------------------------------------------------*/
 extern void vPortSVCHandler(void);
 extern void vPortPendSVHandler(void);
 extern void vPortStartFirstTask(void);
 
-/*---------------------------------------------------------------------------
- *  任务退出错误处理
- *
- *  如果任务函数 return 了会跳到这里（任务不应该 return）
- *---------------------------------------------------------------------------*/
+/*任务退出错误处理*/
 static void prvTaskExitError(void)
 {
     while (1)
         ;
 }
 
-/*---------------------------------------------------------------------------
- *  初始化任务栈
- *
- *  在栈上伪造一个异常栈帧，让 PendSV 能"恢复"这个从未运行过的任务
- *---------------------------------------------------------------------------*/
+/*初始化栈帧*/
 static uint32_t *prvInitialiseStack(uint32_t *pxTopOfStack,
                                     TaskFunction_t pxCode,
                                     void *pvParam)
@@ -133,9 +135,7 @@ static uint32_t *prvInitialiseStack(uint32_t *pxTopOfStack,
     return pxTopOfStack;
 }
 
-/*---------------------------------------------------------------------------
- *  添加任务到就绪链表
- *---------------------------------------------------------------------------*/
+/*添加任务到就绪链表*/
 static void prvAddTaskToReadyList(TCB_t *pxTCB)
 {
     /* 在位图中标记该优先级有任务 */
@@ -146,9 +146,7 @@ static void prvAddTaskToReadyList(TCB_t *pxTCB)
                    &(pxTCB->xStateListItem));
 }
 
-/*---------------------------------------------------------------------------
- *  找到最高就绪优先级，从中取出任务设为 pxCurrentTCB
- *---------------------------------------------------------------------------*/
+/*找到最高就绪优先级，从中取出任务设为 pxCurrentTCB*/
 static void prvSelectHighestPriorityTask(void)
 {
     uint32_t uxTopPriority;
@@ -171,9 +169,61 @@ static void prvSelectHighestPriorityTask(void)
     pxCurrentTCB = (TCB_t *)pxList->pxIndex->pvOwner;
 }
 
-/*---------------------------------------------------------------------------
- *  创建任务
- *---------------------------------------------------------------------------*/
+/*交换延时链表（tick 溢出时调用）*/
+static void prvSwitchDelayedLists(void)
+{
+    List_t *pxTemp;
+
+    /* 交换两个链表指针 */
+    pxTemp = pxDelayedTaskList;
+    pxDelayedTaskList = pxOverflowDelayedTaskList;
+    pxOverflowDelayedTaskList = pxTemp;
+
+    /* 更新最近唤醒时间 */
+    if (pxDelayedTaskList->uxNumberOfItems > 0)
+    {
+        ListItem_t *pxHead = pxDelayedTaskList->xListEnd.pxNext;
+        xNextTaskUnblockTime = pxHead->xItemValue; /*更新为头节点的value值*/
+    }
+    else
+    {
+        xNextTaskUnblockTime = 0xFFFFFFFFUL;
+    }
+}
+
+/*空闲任务函数*/
+static void prvIdleTask(void *param)
+{
+    (void)param;
+
+    while (1)
+    {
+        /* 可以在这里调用用户的钩子函数 */
+        /* vApplicationIdleHook(); */
+    }
+}
+
+/*创建空闲任务，调度器启动时调用*/
+static void prvCreateIdleTask(void)
+{
+    xIdleTaskTCB.pxStack = xIdleTaskStack;
+    xIdleTaskTCB.ulStackSize = 128;
+    xIdleTaskTCB.pxTopOfStack = prvInitialiseStack(
+        xIdleTaskStack + 128,
+        prvIdleTask,
+        NULL);
+    xIdleTaskTCB.uxPriority = 0; /* 最低优先级 */
+
+    strncpy(xIdleTaskTCB.pcTaskName, "IDLE", TASK_NAME_LEN - 1);
+    xIdleTaskTCB.pcTaskName[TASK_NAME_LEN - 1] = '\0';
+
+    vListInitItem(&(xIdleTaskTCB.xStateListItem));
+    xIdleTaskTCB.xStateListItem.pvOwner = &xIdleTaskTCB;
+
+    prvAddTaskToReadyList(&xIdleTaskTCB);
+}
+
+/*创建任务*/
 int32_t xTaskCreate(TaskFunction_t pxTaskCode,
                     const char *pcName,
                     uint32_t ulStackSize,
@@ -239,43 +289,26 @@ int32_t xTaskCreate(TaskFunction_t pxTaskCode,
     return 0;
 }
 
-/*---------------------------------------------------------------------------
- *  主动让出 CPU
- *---------------------------------------------------------------------------*/
-
-/* PendSV 触发宏 */
-#define portNVIC_INT_CTRL_REG (*((volatile uint32_t *)0xE000ED04)) /*把这个地址当成一个 32 位寄存器来访问。（ICSR 寄存器）*/
-#define portNVIC_PENDSVSET_BIT (1UL << 28UL)                       /*ICSR 里的第 28 位，写 1 会把 PendSV 置为 pending。*/
-
+/*触发pendsv，切换上下文*/
 void taskYIELD(void)
 {
     /* 触发 PendSV */
     portNVIC_INT_CTRL_REG = portNVIC_PENDSVSET_BIT;
 }
 
-/*---------------------------------------------------------------------------
- *  上下文切换（PendSV 中调用）
- *---------------------------------------------------------------------------*/
+/*找到最高就绪优先级，从中取出任务设为 pxCurrentTCB，供pendsv调用*/
 void vTaskSwitchContext(void)
 {
     prvSelectHighestPriorityTask();
 }
 
-/*---------------------------------------------------------------------------
- *  获取当前 tick 值
- *---------------------------------------------------------------------------*/
+/* 获取当前 tick 值*/
 uint32_t xTaskGetTickCount(void)
 {
     return xTickCount;
 }
 
-/*---------------------------------------------------------------------------
- *  SysTick 初始化
- *
- *  每 1ms 触发一次 SysTick 中断
- *  SysTick 是 24 位递减计数器
- *  计数到 0 时触发中断并自动重装载
- *---------------------------------------------------------------------------*/
+/*SysTick 初始化*/
 static void prvStartSysTick(void)
 {
 /*
@@ -307,15 +340,9 @@ static void prvStartSysTick(void)
     portNVIC_SYSTICK_CTRL = portNVIC_SYSTICK_CLK | portNVIC_SYSTICK_INT | portNVIC_SYSTICK_EN;
 }
 
-static void prvSwitchDelayedLists(void); /*申明辅助函数*/
-/*---------------------------------------------------------------------------
- *  SysTick 中断处理
- *
- *  每 1ms 执行一次：
- *    1. tick 计数 +1
- *    2. 检查延时链表，唤醒到时间的任务
- *    3. 触发 PendSV 切换任务
- *---------------------------------------------------------------------------*/
+/*SysTick 中断处理,
+  检查延时链表，唤醒到时间的任务，
+  触发pendsv切换任务*/
 void SysTick_Handler(void)
 {
     TCB_t *pxTCB;
@@ -370,21 +397,14 @@ void SysTick_Handler(void)
     taskENABLE_INTERRUPTS();
 }
 
-/*---------------------------------------------------------------------------
- *  进入临界区
- *
- *  支持嵌套：
- *    进入临界区 A        uxCriticalNesting = 1, 关中断
- *      进入临界区 B      uxCriticalNesting = 2, 中断已经关了
- *      退出临界区 B      uxCriticalNesting = 1, 不开中断（还在A里）
- *    退出临界区 A        uxCriticalNesting = 0, 开中断
- *---------------------------------------------------------------------------*/
+/*进入临界区，支持嵌套*/
 void vPortEnterCritical(void)
 {
     taskDISABLE_INTERRUPTS();
     uxCriticalNesting++;
 }
 
+/*退出临界区，支持嵌套*/
 void vPortExitCritical(void)
 {
     uxCriticalNesting--;
@@ -394,42 +414,7 @@ void vPortExitCritical(void)
     }
 }
 
-/*空闲任务函数*/
-static void prvIdleTask(void *param)
-{
-    (void)param;
-
-    while (1)
-    {
-        /* 可以在这里调用用户的钩子函数 */
-        /* vApplicationIdleHook(); */
-    }
-}
-
-/*创建空闲任务，调度器启动时调用*/
-static void prvCreateIdleTask(void)
-{
-    xIdleTaskTCB.pxStack = xIdleTaskStack;
-    xIdleTaskTCB.ulStackSize = 128;
-    xIdleTaskTCB.pxTopOfStack = prvInitialiseStack(
-        xIdleTaskStack + 128,
-        prvIdleTask,
-        NULL);
-    xIdleTaskTCB.uxPriority = 0; /* 最低优先级 */
-
-    strncpy(xIdleTaskTCB.pcTaskName, "IDLE", TASK_NAME_LEN - 1);
-    xIdleTaskTCB.pcTaskName[TASK_NAME_LEN - 1] = '\0';
-
-    vListInitItem(&(xIdleTaskTCB.xStateListItem));
-    xIdleTaskTCB.xStateListItem.pvOwner = &xIdleTaskTCB;
-
-    prvAddTaskToReadyList(&xIdleTaskTCB);
-}
-
-/*---------------------------------------------------------------------------
- *  从就绪链表中移除任务
- *  同时更新优先级位图
- *---------------------------------------------------------------------------*/
+/*从就绪链表中移除任务 同时更新优先级位图*/
 static void prvRemoveTaskFromReadyList(TCB_t *pxTCB)
 {
     /* 从链表中移除，返回剩余节点数 */
@@ -440,12 +425,9 @@ static void prvRemoveTaskFromReadyList(TCB_t *pxTCB)
     }
 }
 
-/*---------------------------------------------------------------------------
- *  挂起任务
- *
- *  把任务从就绪链表移到挂起链表
- *  如果挂起的是当前任务，立刻切换
- *---------------------------------------------------------------------------*/
+/*挂起任务,
+  把任务从就绪链表移到挂起链表
+  如果挂起的是当前任务，立刻切换*/
 void vTaskSuspend(TaskHandle_t xTaskToSuspend)
 {
     TCB_t *pxTCB;
@@ -477,12 +459,9 @@ void vTaskSuspend(TaskHandle_t xTaskToSuspend)
     }
 }
 
-/*---------------------------------------------------------------------------
- *  恢复任务
- *
- *  把任务从挂起链表移回就绪链表
- *  如果恢复的任务优先级比当前任务高，触发切换
- *---------------------------------------------------------------------------*/
+/*恢复任务
+  把任务从挂起链表移回就绪链表
+  如果恢复的任务优先级比当前任务高，触发切换*/
 void vTaskResume(TaskHandle_t xTaskToResume)
 {
     TCB_t *pxTCB = xTaskToResume;
@@ -514,15 +493,11 @@ void vTaskResume(TaskHandle_t xTaskToResume)
     taskEXIT_CRITICAL();
 }
 
-/*---------------------------------------------------------------------------
- *  删除任务
- *
- *  从就绪/挂起链表移除
- *  如果删除的是自己，切换到其他任务
- *
- *  注意：Phase 1 用的是静态分配，所以这里只是从链表移除
- *  不需要释放内存。后续改成动态分配时再加内存释放。
- *---------------------------------------------------------------------------*/
+/*删除任务
+  从就绪/挂起链表移除
+  如果删除的是自己，切换到其他任务
+  Phase 1 用的是静态分配，所以这里只是从链表移除
+  不需要释放内存。后续改成动态分配时再加内存释放。*/
 void vTaskDelete(TaskHandle_t xTaskToDelete)
 {
     TCB_t *pxTCB;
@@ -584,11 +559,7 @@ static void prvInitialiseDelayLists(void)
     pxOverflowDelayedTaskList = &xDelayedTaskList2;
 }
 
-/*---------------------------------------------------------------------------
- *  把任务加入延时链表
- *
- *  根据唤醒时间是否溢出，放入不同的链表
- *---------------------------------------------------------------------------*/
+/*把任务加入延时链表,根据唤醒时间是否溢出，放入不同的链表*/
 static void prvAddCurrentTaskToDelayedList(uint32_t xTicksToDelay)
 {
     uint32_t xTimeToWake;
@@ -617,35 +588,7 @@ static void prvAddCurrentTaskToDelayedList(uint32_t xTicksToDelay)
     }
 }
 
-/*---------------------------------------------------------------------------
- *  交换延时链表（tick 溢出时调用）
- *---------------------------------------------------------------------------*/
-static void prvSwitchDelayedLists(void)
-{
-    List_t *pxTemp;
-
-    /* 交换两个链表指针 */
-    pxTemp = pxDelayedTaskList;
-    pxDelayedTaskList = pxOverflowDelayedTaskList;
-    pxOverflowDelayedTaskList = pxTemp;
-
-    /* 更新最近唤醒时间 */
-    if (pxDelayedTaskList->uxNumberOfItems > 0)
-    {
-        ListItem_t *pxHead = pxDelayedTaskList->xListEnd.pxNext;
-        xNextTaskUnblockTime = pxHead->xItemValue; /*更新为头节点的value值*/
-    }
-    else
-    {
-        xNextTaskUnblockTime = 0xFFFFFFFFUL;
-    }
-}
-
-/*---------------------------------------------------------------------------
- *  任务延时
- *
- *  让当前任务进入阻塞态，xTicksToDelay 个 tick 后自动唤醒
- *---------------------------------------------------------------------------*/
+/*任务延时，让当前任务进入阻塞态，到底唤醒时间后自动唤醒*/
 void vTaskDelay(uint32_t xTicksToDelay)
 {
     if (xTicksToDelay == 0)
@@ -669,9 +612,7 @@ void vTaskDelay(uint32_t xTicksToDelay)
     portNVIC_INT_CTRL_REG = portNVIC_PENDSVSET_BIT;
 }
 
-/*---------------------------------------------------------------------------
- *  启动调度器
- *---------------------------------------------------------------------------*/
+/*启动调度器*/
 void vTaskStartScheduler(void)
 {
     /* 初始化挂起链表和删除等待链表 */
