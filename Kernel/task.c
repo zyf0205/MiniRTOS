@@ -22,7 +22,7 @@ static uint32_t xIdleTaskStack[128];
 static TCB_t xIdleTaskTCB;
 
 /* 系统节拍计数 */
-static volatile uint32_t xTickCount = 0;
+volatile uint32_t xTickCount = 0;
 
 /* 临界区嵌套计数 */
 static volatile uint32_t uxCriticalNesting = 0;
@@ -51,11 +51,9 @@ static void prvTaskExitError(void);
 static uint32_t *prvInitialiseStack(uint32_t *pxTopOfStack,
                                     TaskFunction_t pxCode,
                                     void *pvParam);
-static void prvAddTaskToReadyList(TCB_t *pxTCB);
 static void prvSelectHighestPriorityTask(void);
 static void prvSwitchDelayedLists(void);
 static void prvIdleTask(void *param);
-static void prvCreateIdleTask(void);
 
 /*---------------------------------------------------------------------------
  *  三个汇编函数，在portasm.s中编写
@@ -136,7 +134,7 @@ static uint32_t *prvInitialiseStack(uint32_t *pxTopOfStack,
 }
 
 /*添加任务到就绪链表*/
-static void prvAddTaskToReadyList(TCB_t *pxTCB)
+void prvAddTaskToReadyList(TCB_t *pxTCB)
 {
     /* 在位图中标记该优先级有任务 */
     uxTopReadyPriority |= (1UL << pxTCB->uxPriority);
@@ -217,8 +215,11 @@ static void prvCreateIdleTask(void)
     strncpy(xIdleTaskTCB.pcTaskName, "IDLE", TASK_NAME_LEN - 1);
     xIdleTaskTCB.pcTaskName[TASK_NAME_LEN - 1] = '\0';
 
+    /*初始化链表项，包含队列阻塞链表项*/
     vListInitItem(&(xIdleTaskTCB.xStateListItem));
     xIdleTaskTCB.xStateListItem.pvOwner = &xIdleTaskTCB;
+    vListInitItem(&(xIdleTaskTCB.xEventListItem));
+    xIdleTaskTCB.xEventListItem.pvOwner = &xIdleTaskTCB;
 
     prvAddTaskToReadyList(&xIdleTaskTCB);
 }
@@ -278,6 +279,8 @@ int32_t xTaskCreate(TaskFunction_t pxTaskCode,
     /* 6. 初始化链表节点 */
     vListInitItem(&(pxNewTCB->xStateListItem));
     pxNewTCB->xStateListItem.pvOwner = pxNewTCB; /* 节点指向自己的 TCB */
+    vListInitItem(&(pxNewTCB->xEventListItem));  /*队列阻塞链表箱*/
+    pxNewTCB->xEventListItem.pvOwner = pxNewTCB;
 
     /* 7. 加入就绪链表 */
     prvAddTaskToReadyList(pxNewTCB);
@@ -386,6 +389,12 @@ void SysTick_Handler(void)
             pxTCB = (TCB_t *)pxHead->pvOwner;
             uxListRemove(pxHead);
 
+            /* 如果任务还在队列等待链表上，也移除 ← 新增 */
+            if (pxTCB->xEventListItem.pvContainer != NULL)
+            {
+                uxListRemove(&(pxTCB->xEventListItem));
+            }
+
             /* 放回就绪链表 */
             prvAddTaskToReadyList(pxTCB);
         }
@@ -415,7 +424,7 @@ void vPortExitCritical(void)
 }
 
 /*从就绪链表中移除任务 同时更新优先级位图*/
-static void prvRemoveTaskFromReadyList(TCB_t *pxTCB)
+void prvRemoveTaskFromReadyList(TCB_t *pxTCB)
 {
     /* 从链表中移除，返回剩余节点数 */
     if (uxListRemove(&(pxTCB->xStateListItem)) == 0)
@@ -560,7 +569,7 @@ static void prvInitialiseDelayLists(void)
 }
 
 /*把任务加入延时链表,根据唤醒时间是否溢出，放入不同的链表*/
-static void prvAddCurrentTaskToDelayedList(uint32_t xTicksToDelay)
+void prvAddCurrentTaskToDelayedList(uint32_t xTicksToDelay)
 {
     uint32_t xTimeToWake;
 

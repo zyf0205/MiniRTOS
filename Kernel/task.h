@@ -46,7 +46,8 @@ typedef struct TCB
 {
     volatile uint32_t *pxTopOfStack; /* 必须是第一个字段！ */
 
-    ListItem_t xStateListItem; /* 挂在就绪/延时链表上 */
+    ListItem_t xStateListItem; /* 挂在就绪/延时/挂起链表上 */
+    ListItem_t xEventListItem; /* 挂在队列等待链表上  */
 
     uint32_t uxPriority; /* 优先级 */
 
@@ -78,5 +79,7 @@ void vTaskSuspend(TaskHandle_t xTaskToSuspend);
 void vTaskResume(TaskHandle_t xTaskToResume);
 void vTaskDelete(TaskHandle_t xTaskToDelete);
 void vTaskDelay(uint32_t xTicksToDelay);
+void prvCreateIdleTask(void);
+void prvAddTaskToReadyList(TCB_t *pxTCB);
 void vSafePrintf(const char *fmt, ...);
 #endif
