@@ -81,5 +81,7 @@ void vTaskDelete(TaskHandle_t xTaskToDelete);
 void vTaskDelay(uint32_t xTicksToDelay);
 void prvCreateIdleTask(void);
 void prvAddTaskToReadyList(TCB_t *pxTCB);
+/* 供 mutex.c 使用的优先级操作 */
+void vTaskPrioritySet(TCB_t *pxTCB, uint32_t uxNewPriority);
 void vSafePrintf(const char *fmt, ...);
 #endif

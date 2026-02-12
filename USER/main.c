@@ -3,81 +3,147 @@
 #include "led.h"
 #include "usart.h"
 #include "task.h"
-#include "queue.h"
-#include "sem.h"
+#include "mutex.h"
+
+MutexHandle_t xMutex = NULL;
 
 /*===========================================================
- *  测试 1：二值信号量
+ *  测试 1：基本互斥
  *
- *  TaskGiver 每 1000ms Give 一次
- *  TaskTaker 一直 Take 等待
+ *  两个任务抢同一个互斥量
+ *  持有锁期间模拟"干活"，释放后让出
  *===========================================================*/
 
-SemaphoreHandle_t xBinarySem = NULL;
-
-void TaskGiver(void *param)
+void TaskA(void *param)
 {
     (void)param;
     uint32_t count = 0;
 
     while (1) {
-        vTaskDelay(1000);
-        count++;
+        vSafePrintf("[A] Waiting for mutex...\r\n");
 
-        xSemaphoreGive(xBinarySem);
-        vSafePrintf("[Giver] Give #%d  tick=%d\r\n",
-                    (int)count, (int)xTaskGetTickCount());
+        if (xMutexTake(xMutex, portMAX_DELAY) == 0) {
+            count++;
+            vSafePrintf("[A] Got mutex #%d  tick=%d\r\n",
+                        (int)count, (int)xTaskGetTickCount());
+
+            /* 模拟干活 */
+            vTaskDelay(500);
+
+            vSafePrintf("[A] Releasing mutex  tick=%d\r\n",
+                        (int)xTaskGetTickCount());
+            xMutexGive(xMutex);
+        }
+
+        vTaskDelay(100);
     }
 }
 
-void TaskTaker(void *param)
+void TaskB(void *param)
 {
     (void)param;
     uint32_t count = 0;
 
     while (1) {
-        if (xSemaphoreTake(xBinarySem, portMAX_DELAY) == 0) {
+        vSafePrintf("[B] Waiting for mutex...\r\n");
+
+        if (xMutexTake(xMutex, portMAX_DELAY) == 0) {
             count++;
-            vSafePrintf("[Taker] Take #%d  tick=%d\r\n",
+            vSafePrintf("[B] Got mutex #%d  tick=%d\r\n",
                         (int)count, (int)xTaskGetTickCount());
+
+            vTaskDelay(300);
+
+            vSafePrintf("[B] Releasing mutex  tick=%d\r\n",
+                        (int)xTaskGetTickCount());
+            xMutexGive(xMutex);
         }
+
+        vTaskDelay(100);
     }
 }
 
 /*===========================================================
- *  测试 2：计数信号量（模拟 3 个停车位）
+ *  测试 2：优先级继承
+ *
+ *  TaskH（高优先级）和 TaskL（低优先级）抢互斥量
+ *  TaskM（中优先级）不用互斥量，只管跑
+ *
+ *  如果优先级继承生效：
+ *    TaskL 持有锁时被提升到高优先级
+ *    TaskM 抢不了 TaskL
+ *    TaskH 等待时间短
+ *
  *  先注释掉，测试 1 通过后再打开
  *===========================================================*/
 
-SemaphoreHandle_t xParkingSem = NULL;
 
-void TaskCar(void *param)
+void TaskH_High(void *param)
 {
-    uint32_t id = (uint32_t)param;
+    (void)param;
 
-    while (1) {
-        vSafePrintf("[Car%d] Waiting for parking...\r\n", (int)id);
+    vTaskDelay(200);
 
-        if (xSemaphoreTake(xParkingSem, 5000) == 0) {
-            vSafePrintf("[Car%d] Parked!  free=%d  tick=%d\r\n",
-                        (int)id,
-                        (int)uxSemaphoreGetCount(xParkingSem),
+    while (1)
+    {
+        vSafePrintf("[H] Waiting for mutex... tick=%d\r\n",
+                    (int)xTaskGetTickCount());
+
+        if (xMutexTake(xMutex, portMAX_DELAY) == 0)
+        {
+            vSafePrintf("[H] Got mutex!  tick=%d\r\n",
                         (int)xTaskGetTickCount());
 
-            vTaskDelay(2000 + id * 500);
+            vTaskDelay(200);
 
-            xSemaphoreGive(xParkingSem);
-            vSafePrintf("[Car%d] Left!    free=%d  tick=%d\r\n",
-                        (int)id,
-                        (int)uxSemaphoreGetCount(xParkingSem),
+            vSafePrintf("[H] Releasing mutex  tick=%d\r\n",
                         (int)xTaskGetTickCount());
-        } else {
-            vSafePrintf("[Car%d] TIMEOUT! No space!\r\n", (int)id);
+            xMutexGive(xMutex);
         }
 
-        vTaskDelay(500);
+        vTaskDelay(1000);
     }
 }
+
+void TaskM_Mid(void *param)
+{
+    (void)param;
+    uint32_t count = 0;
+
+    while (1)
+    {
+        count++;
+        vSafePrintf("[M] Running #%d  tick=%d\r\n",
+                    (int)count, (int)xTaskGetTickCount());
+        vTaskDelay(100);
+    }
+}
+
+void TaskL_Low(void *param)
+{
+    (void)param;
+
+    while (1)
+    {
+        vSafePrintf("[L] Taking mutex... tick=%d\r\n",
+                    (int)xTaskGetTickCount());
+
+        if (xMutexTake(xMutex, portMAX_DELAY) == 0)
+        {
+            vSafePrintf("[L] Got mutex, working... tick=%d\r\n",
+                        (int)xTaskGetTickCount());
+
+            vTaskDelay(500);
+
+            vSafePrintf("[L] Releasing mutex  tick=%d\r\n",
+                        (int)xTaskGetTickCount());
+            xMutexGive(xMutex);
+        }
+
+        vTaskDelay(200);
+    }
+}
+
 
 /*===========================================================
  *  主函数
@@ -89,21 +155,26 @@ int main(void)
 
     printf("\r\n\r\n");
     printf("===========================\r\n");
-    printf("  MiniRTOS Phase 6+7 Test\r\n");
+    printf("  MiniRTOS Phase 8 Test\r\n");
     printf("===========================\r\n\r\n");
 
-    /* 测试 1：二值信号量 */
-    // xBinarySem = xSemaphoreCreateBinary();
-    // xTaskCreate(TaskGiver, "Giver", 128, NULL, 1, NULL);
-    // xTaskCreate(TaskTaker, "Taker", 128, NULL, 2, NULL);
+    xMutex = xMutexCreate();
+    if (xMutex == NULL) {
+        printf("Mutex create FAILED!\r\n");
+        while (1);
+    }
+    printf("Mutex created OK\r\n\r\n");
 
-    /* 测试 2：计数信号量（先注释） */
+    /* 测试 1：基本互斥 */
+    // xTaskCreate(TaskA, "TaskA", 128, NULL, 1, NULL);
+    // xTaskCreate(TaskB, "TaskB", 128, NULL, 1, NULL);
 
-    xParkingSem = xSemaphoreCreateCounting(3, 3);
-    xTaskCreate(TaskCar, "Car1", 128, (void *)1, 1, NULL);
-    xTaskCreate(TaskCar, "Car2", 128, (void *)2, 1, NULL);
-    xTaskCreate(TaskCar, "Car3", 128, (void *)3, 1, NULL);
-    xTaskCreate(TaskCar, "Car4", 128, (void *)4, 1, NULL);
+    /* 测试 2：优先级继承（先注释） */
+    
+    xTaskCreate(TaskH_High, "TaskH", 128, NULL, 3, NULL);
+    xTaskCreate(TaskM_Mid,  "TaskM", 128, NULL, 2, NULL);
+    xTaskCreate(TaskL_Low,  "TaskL", 128, NULL, 1, NULL);
+    
 
     printf("Starting scheduler...\r\n\r\n");
     vTaskStartScheduler();

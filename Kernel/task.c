@@ -621,6 +621,30 @@ void vTaskDelay(uint32_t xTicksToDelay)
     portNVIC_INT_CTRL_REG = portNVIC_PENDSVSET_BIT;
 }
 
+/*修改任务优先级  从旧优先级的就绪链表移除，加入新优先级的就绪链表*/
+void vTaskPrioritySet(TCB_t *pxTCB, uint32_t uxNewPriority)
+{
+    if (uxNewPriority >= MAX_PRIORITIES)
+        uxNewPriority = MAX_PRIORITIES - 1;
+
+    if (pxTCB->uxPriority == uxNewPriority)
+        return;
+
+    /* 如果任务在就绪链表中，需要移动 */
+    if (pxTCB->xStateListItem.pvContainer ==
+        &pxReadyTasksLists[pxTCB->uxPriority])
+    {
+        prvRemoveTaskFromReadyList(pxTCB);
+        pxTCB->uxPriority = uxNewPriority;
+        prvAddTaskToReadyList(pxTCB);
+    }
+    else
+    {
+        /* 在延时/挂起/等待链表中，只改优先级值 */
+        pxTCB->uxPriority = uxNewPriority;
+    }
+}
+
 /*启动调度器*/
 void vTaskStartScheduler(void)
 {
