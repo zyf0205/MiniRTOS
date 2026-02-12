@@ -10,6 +10,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stm32f4xx.h>
+#include "heap.h"
 
 /*---------------------------------------------------------------------------
  *  全局变量
@@ -20,7 +21,7 @@ TCB_t *volatile pxCurrentTCB = NULL;
 /* 空闲任务的栈和 TCB */
 static uint32_t xIdleTaskStack[128];
 static TCB_t xIdleTaskTCB;
-
+static uint8_t uxDeletedTasksWaitingCleanUp; /*等待回收的任务数*/
 /* 系统节拍计数 */
 volatile uint32_t xTickCount = 0;
 
@@ -189,15 +190,37 @@ static void prvSwitchDelayedLists(void)
     }
 }
 
-/*空闲任务函数*/
+/*空闲任务函数,标记后在空闲任务里面回收堆*/
 static void prvIdleTask(void *param)
 {
     (void)param;
 
     while (1)
     {
-        /* 可以在这里调用用户的钩子函数 */
-        /* vApplicationIdleHook(); */
+        while (uxDeletedTasksWaitingCleanUp > 0)
+        {
+            TCB_t *pxTCB;
+            ListItem_t *pxItem;
+
+            taskENTER_CRITICAL();
+
+            pxItem = xTasksWaitingTermination.xListEnd.pxNext;
+            if ((void *)pxItem != (void *)&(xTasksWaitingTermination.xListEnd))
+            {
+                pxTCB = (TCB_t *)pxItem->pvOwner;
+                uxListRemove(pxItem);
+                uxDeletedTasksWaitingCleanUp--;
+                taskEXIT_CRITICAL();
+
+                vPortFree(pxTCB->pxStack);
+                vPortFree(pxTCB);
+            }
+            else
+            {
+                taskEXIT_CRITICAL();
+                break;
+            }
+        }
     }
 }
 
@@ -247,18 +270,33 @@ int32_t xTaskCreate(TaskFunction_t pxTaskCode,
         ulFirstCall = 0;
     }
 
-    /* 1. 分配栈空间（静态分配，用 static 数组模拟） */
-    /*    正式版应该用 malloc，这里为了简单先用 static */
-    static uint32_t ulTaskCount = 0;     /*任务数量*/
-    static uint32_t xTaskStacks[4][256]; /* 最多 4 个任务，每个任务 256 字 = 1KB */
-    static TCB_t xTCBs[4];               /*存放tcb的数组*/
+    /*静态分配*/
+    // /* 1. 分配栈空间（静态分配，用 static 数组模拟） */
+    // /*    正式版应该用 malloc，这里为了简单先用 static */
+    // static uint32_t ulTaskCount = 0;     /*任务数量*/
+    // static uint32_t xTaskStacks[4][256]; /* 最多 4 个任务，每个任务 256 字 = 1KB */
+    // static TCB_t xTCBs[4];               /*存放tcb的数组*/
 
-    if (ulTaskCount >= 4) /*超过四个任务，直接返回*/
+    // if (ulTaskCount >= 4) /*超过四个任务，直接返回*/
+    //     return -1;
+
+    // pxStack = xTaskStacks[ulTaskCount]; /*得到栈底地址*/
+    // pxNewTCB = &xTCBs[ulTaskCount];     /*把tcb放到数组里*/
+    // ulTaskCount++;
+
+    /*动态分配*/
+    /* 动态分配栈 */
+    pxStack = (uint32_t *)pvPortMalloc(ulStackSize * sizeof(uint32_t));
+    if (pxStack == NULL)
         return -1;
 
-    pxStack = xTaskStacks[ulTaskCount]; /*得到栈底地址*/
-    pxNewTCB = &xTCBs[ulTaskCount];     /*把tcb放到数组里*/
-    ulTaskCount++;
+    /* 动态分配 TCB */
+    pxNewTCB = (TCB_t *)pvPortMalloc(sizeof(TCB_t));
+    if (pxNewTCB == NULL)
+    {
+        vPortFree(pxStack);
+        return -1;
+    }
 
     /* 2. 记录栈信息 */
     pxNewTCB->pxStack = pxStack;         /*更新tcb栈底地址*/
@@ -505,42 +543,47 @@ void vTaskResume(TaskHandle_t xTaskToResume)
 /*删除任务
   从就绪/挂起链表移除
   如果删除的是自己，切换到其他任务
-  Phase 1 用的是静态分配，所以这里只是从链表移除
-  不需要释放内存。后续改成动态分配时再加内存释放。*/
+  包含内存释放。*/
 void vTaskDelete(TaskHandle_t xTaskToDelete)
 {
     TCB_t *pxTCB;
 
     taskENTER_CRITICAL();
 
-    /* NULL 表示删除自己 */
     if (xTaskToDelete == NULL)
-    {
         pxTCB = pxCurrentTCB;
-    }
     else
-    {
         pxTCB = xTaskToDelete;
-    }
 
-    /* 从当前所在链表移除（可能在就绪或挂起链表） */
+    /* 从链表移除 */
     if (pxTCB->xStateListItem.pvContainer != NULL)
     {
         uxListRemove(&(pxTCB->xStateListItem));
-
-        /* 如果是从就绪链表移除的，更新位图 */
         if (pxReadyTasksLists[pxTCB->uxPriority].uxNumberOfItems == 0)
         {
             uxTopReadyPriority &= ~(1UL << pxTCB->uxPriority);
         }
     }
 
-    taskEXIT_CRITICAL();
+    if (pxTCB->xEventListItem.pvContainer != NULL)
+    {
+        uxListRemove(&(pxTCB->xEventListItem));
+    }
 
-    /* 如果删除的是自己，切换到其他任务 */
     if (pxTCB == pxCurrentTCB)
     {
+        /* 删除自己：标记让空闲任务回收 */
+        vListInsertEnd(&xTasksWaitingTermination, &(pxTCB->xStateListItem));
+        uxDeletedTasksWaitingCleanUp++;
+        taskEXIT_CRITICAL();
         portNVIC_INT_CTRL_REG = portNVIC_PENDSVSET_BIT;
+    }
+    else
+    {
+        /* 删除别人：直接释放 */
+        taskEXIT_CRITICAL();
+        vPortFree(pxTCB->pxStack);
+        vPortFree(pxTCB);
     }
 }
 
